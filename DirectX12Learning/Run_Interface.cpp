@@ -4,6 +4,10 @@
 int main(HINSTANCE hInstance)
 {
 	MyDirect3DApp theApp(hInstance);
-	theApp.Initialize();
-	theApp.LogAdpt();
+	//theApp.Initialize();
+	//theApp.LogAdpt();
+	theApp.BuildAllUp();
+
+	theApp.Run();
+	
 }

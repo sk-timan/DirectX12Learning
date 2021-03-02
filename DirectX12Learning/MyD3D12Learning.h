@@ -24,6 +24,20 @@ public:
 
 	void BuildCommandQueue();
 
+	void BuildSwapChain();
+
+	void BuildDescriptorHeap();
+
+	void BuildRenderTargetView();
+
+	void BuildDepthStencilView();
+
+	void UpdateViewPortTransform();
+
+	void SetScissorRectangle();
+
+	void BuildAllUp();
+
 private:
 
 	//virtual void OnResize()override;
