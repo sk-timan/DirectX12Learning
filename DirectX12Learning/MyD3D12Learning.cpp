@@ -381,7 +381,164 @@ bool MyBox::Initialize()
 	ThrowIfFailed(mCommandList->Reset(mDirectCmdListAlloc.Get(), nullptr));
 
 	BuildDescriptorHeaps();
+	BuildConstantBuffers();
+	BuildRootSignature();
+	BuildShadersAndInputLayout();
+	BuildBoxGeometry();
+	BuildPSO();
+
+	// 执行初始化命令
+	ThrowIfFailed(mCommandList->Close());
+	ID3D12CommandList* cmdsLists[] = { mCommandList.Get() };
+	mCommandQueue->ExecuteCommandLists(_countof(cmdsLists), cmdsLists);
+
+	// 等待初始化完成
+	FlushCommandQueue();
+
+	return true;
+
+}
+
+void MyBox::OnResize()
+{
+	D3DApp::OnResize();
+
+	// 若用户调整了窗口尺寸， 则更新横纵比并重新计算投影矩阵
+	XMMATRIX P = XMMatrixPerspectiveFovLH(0.25f * MathHelper::Pi, AspectRatio(), 1.0f, 1000.0f);
+	XMStoreFloat4x4(&mProj, P);
+}
+
+void MyBox::Update(const GameTimer& gt)
+{
+	// 将球坐标转换为笛卡尔坐标
+	float x = mRadius * sinf(mPhi) * cosf(mTheta);
+	float z = mRadius * sinf(mPhi) * sinf(mTheta);
+	float y = mRadius * cosf(mPhi);
+
+	// 构建观察矩阵
+	XMVECTOR pos = XMVectorSet(x, y, z, 1.0f);
+	XMVECTOR target = XMVectorZero();
+	XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+
+	XMMATRIX view = XMMatrixLookAtLH(pos, target, up);
+	XMStoreFloat4x4(&mView, view);
+
+	XMMATRIX world = XMLoadFloat4x4(&mWorld);
+	XMMATRIX proj = XMLoadFloat4x4(&mProj);
+	XMMATRIX worldViewProj = world * view * proj;
+
+	// 用当前最新的worldViewProj矩阵来更新常量缓冲区
+	ObjectConstants objConstants;
+	XMStoreFloat4x4(&objConstants.WorldViewProj, XMMatrixTranspose(worldViewProj));
+	mObjectCB->CopyData(0, objConstants);
+}
+
+void MyBox::Draw(const GameTimer& gt)
+{
+	// 复用记录命令所用的内存
+	// 只有当GPU中的命令列表执行完毕后，我们才可对其进行重置
+	ThrowIfFailed(mDirectCmdListAlloc->Reset());
+
+	// 通过函数ExecuteCommandList将命令列表加入命令队列后，便可对他进行重置
+	// 复用命令列表即复用其相应的内存
+	ThrowIfFailed(mCommandList->Reset(mDirectCmdListAlloc.Get(), mPSO.Get()));
+	mCommandList->RSSetViewports(1, &mScreenViewport);
+	mCommandList->RSSetScissorRects(1, &mScissorRect);
+
+	// 按照资源的用途指示其状态的转变，此处将资源从呈现状态转换为渲染目标状态
+	mCommandList->ResourceBarrier(1,
+		&CD3DX12_RESOURCE_BARRIER::Transition(
+			CurrentBackBuffer(),
+			D3D12_RESOURCE_STATE_PRESENT,
+			D3D12_RESOURCE_STATE_RENDER_TARGET)
+	);
+
+	// 清除后台缓冲区和深度缓冲区
+	mCommandList->ClearRenderTargetView(CurrentBackBufferView(), Colors::LightSteelBlue, 0, nullptr);
+	mCommandList->ClearDepthStencilView(DepthStencilView(), D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, // 位运算
+		1.0f, 0, 0, nullptr);
+
+	// 指定将要渲染的目标缓冲区
+	mCommandList->OMSetRenderTargets(1, &CurrentBackBufferView(), true, &DepthStencilView());
 	
+	ID3D12DescriptorHeap* descriptorHeaps[] = { mCbvHeap.Get() };
+	mCommandList->SetDescriptorHeaps(_countof(descriptorHeaps), descriptorHeaps);
+
+	mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
+
+	mCommandList->IASetVertexBuffers(0, 1, &mBoxGeo->VertexBufferView());
+	mCommandList->IASetIndexBuffer(&mBoxGeo->IndexBufferView());
+	mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+	mCommandList->SetGraphicsRootDescriptorTable(0, mCbvHeap->GetGPUDescriptorHandleForHeapStart());
+
+	mCommandList->DrawIndexedInstanced(mBoxGeo->DrawArgs["box"].IndexCount, 1, 0, 0, 0);
+
+	// 按照资源的用途指示其状态的转变，此处将资源从渲染目标状态转换为呈现状态
+	mCommandList->ResourceBarrier(1,
+		&CD3DX12_RESOURCE_BARRIER::Transition(CurrentBackBuffer(),
+			D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT));
+
+	// 完成命令的记录
+	ThrowIfFailed(mCommandList->Close());
+
+	// 向命令队列添加欲执行的命令列表
+	ID3D12CommandList* cmdsLists[] = { mCommandList.Get() };
+	mCommandQueue->ExecuteCommandLists(_countof(cmdsLists), cmdsLists);
+
+	// 交换后台缓冲区与前台缓冲区
+	ThrowIfFailed(mSwapChain->Present(0, 0));
+	mCurrBackBuffer = (mCurrBackBuffer + 1) % SwapChainBufferCount;
+
+	// 等待绘制此帧的一系列命令执行完毕。这种等待的方法虽然简单但也低效
+	// 在后面将展示如何重新组织渲染代码，使我们不必在每一帧时都等待
+	FlushCommandQueue();
+
+}
+
+void MyBox::OnMouseDown(WPARAM btnState, int x, int y)
+{
+	mLastMousePos.x = x;
+	mLastMousePos.y = y;
+
+	SetCapture(mhMainWnd);
+}
+
+void MyBox::OnMouseUp(WPARAM btnState, int x, int y)
+{
+	ReleaseCapture();
+}
+
+void MyBox::OnMouseMove(WPARAM btnState, int x, int y)
+{
+	if ((btnState & MK_LBUTTON) != 0)
+	{
+		// 根据鼠标的移动距离计算旋转角度，并令每个像素都按此角度的1/4旋转
+		float dx = XMConvertToRadians(0.25 * static_cast<float>(x - mLastMousePos.x));
+		float dy = XMConvertToRadians(0.25 * static_cast<float>(y - mLastMousePos.y));
+
+		// 根据鼠标的输入来更新摄像机绕立方体旋转的角度
+		mTheta += dx;
+		mPhi += dy;
+
+		// 限制角度mPhi的范围
+		mPhi = MathHelper::Clamp(mPhi, 0.1f, MathHelper::Pi - 0.1f);
+	}
+	else if ((btnState & MK_RBUTTON) != 0)
+	{
+		// 使场景中的每个像素按鼠标移动距离的0.005倍进行缩放
+		float dx = 0.005f * static_cast<float>(x - mLastMousePos.x);
+		float dy = 0.005f * static_cast<float>(y - mLastMousePos.y);
+
+		// 根据鼠标的输入更新摄像头的可视范围半径
+		mRadius += dx - dy;
+
+		// 限制可视半径的范围
+		mRadius = MathHelper::Clamp(mRadius, 3.0f, 15.0f);
+	}
+
+	mLastMousePos.x = x;
+	mLastMousePos.y = y;
 }
 
 void MyBox::BuildDescriptorHeaps()
@@ -416,25 +573,27 @@ void MyBox::BuildConstantBuffers()
 
 void MyBox::BuildRootSignature()
 {
-	// Shader programs typically require resources as input (constant buffers,
-	// textures, samplers).  The root signature defines the resources the shader
-	// programs expect.  If we think of the shader programs as a function, and
-	// the input resources as function parameters, then the root signature can be
-	// thought of as defining the function signature.  
+	// 着色器程序一般需要以资源作为输入(例如常量缓冲区、纹理、采样器等)
+	// 根签名则定义了着色器程序所需的具体资源
+	// 如果把着色器程序看作一个函数，而输入的资源当作向函数传递的参数数据，那么便可以类似的认为根签名
+	// 定义的是函数签名
 
-	// Root parameter can be a table, root descriptor or root constants.
+	// 根参数可以是描述符表、根描述符或根常量
 	CD3DX12_ROOT_PARAMETER slotRootParameter[1];
 
-	// Create a single descriptor table of CBVs.
+	// 创建一个只存有一个CBV的描述符表
 	CD3DX12_DESCRIPTOR_RANGE cbvTable;
-	cbvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0);
-	slotRootParameter[0].InitAsDescriptorTable(1, &cbvTable);
-
-	// A root signature is an array of root parameters.
+	cbvTable.Init(
+		D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 
+		1,				// 表中描述符数量
+		0);				// 将这段描述符区域绑定至此基准着色器寄存器(base shader register)
+	slotRootParameter[0].InitAsDescriptorTable(1, 
+		&cbvTable);		// 指向描述符区域数组的指针
+	// 根签名由一组根参数构成
 	CD3DX12_ROOT_SIGNATURE_DESC rootSigDesc(1, slotRootParameter, 0, nullptr,
 		D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
 
-	// create a root signature with a single slot which points to a descriptor range consisting of a single constant buffer
+	// 创建仅含一个槽位(该槽位指向一个仅由单个常量缓冲区组成的描述符区域)的根签名
 	ComPtr<ID3DBlob> serializedRootSig = nullptr;
 	ComPtr<ID3DBlob> errorBlob = nullptr;
 	HRESULT hr = D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1,
@@ -451,4 +610,212 @@ void MyBox::BuildRootSignature()
 		serializedRootSig->GetBufferPointer(),
 		serializedRootSig->GetBufferSize(),
 		IID_PPV_ARGS(&mRootSignature)));
+
+}
+
+void MyBox::BuildShadersAndInputLayout()
+{
+	HRESULT hr = S_OK;
+
+	mvsByteCode = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "VS", "vs_5_0");
+	mpsByteCode = d3dUtil::CompileShader(L"Shaders\\color.hlsl", nullptr, "PS", "ps_5_0");
+
+	mInputLayout =
+	{
+		{"POSITION",						// 语义名，可将顶点结构体的元素(如这里的Vertex结构体的Pos)与顶点
+											// 着色器输入签名中的元素一一映射起来
+		0,									// 附加到语义上的索引，可在不引入新的语义名下，区分两组数据
+		DXGI_FORMAT_R32G32B32_FLOAT,		// 顶点元素格式
+		0,									// 传递元素用输入槽
+		0,									// 特定输入槽中，该元素的起始地址偏移量
+		D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, // 是否Instance
+		0},
+
+		{"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}
+	};
+
+
+
+/** color.hlsl
+cbuffer cbPerObject : register(b0)
+{
+	float4x4 gWorldViewProj; 
+};
+
+struct VertexIn
+{
+	float3 PosL  : POSITION;
+    	float4 Color : COLOR;
+};
+
+struct VertexOut
+{
+	float4 PosH  : SV_POSITION;
+	float4 Color : COLOR;
+};
+
+VertexOut VS(VertexIn vin)
+{
+	VertexOut vout;
+	
+	// Transform to homogeneous clip space.
+	vout.PosH = mul(float4(vin.PosL, 1.0f), gWorldViewProj);    点乘
+	
+	// Just pass vertex color into the pixel shader.
+   	 vout.Color = vin.Color;
+    
+   	 return vout;
+}
+
+float4 PS(VertexOut pin) : SV_Target
+{
+	return pin.Color;
+}
+*/
+}
+
+void MyBox::BuildBoxGeometry()
+{
+	std::array<Vertex, 8> vertices =
+	{
+		Vertex({XMFLOAT3(-1.0f,-1.0f,-1.0f),XMFLOAT4(Colors::White)}),
+		Vertex({XMFLOAT3(-1.0f,1.0f,-1.0f),XMFLOAT4(Colors::Black)}),
+		Vertex({XMFLOAT3(1.0f,1.0f,-1.0f),XMFLOAT4(Colors::Red)}),
+		Vertex({XMFLOAT3(1.0f,-1.0f,-1.0f),XMFLOAT4(Colors::Green)}),
+		Vertex({XMFLOAT3(-1.0f,-1.0f,1.0f),XMFLOAT4(Colors::Blue)}),
+		Vertex({XMFLOAT3(-1.0f,1.0f,1.0f),XMFLOAT4(Colors::Yellow)}),
+		Vertex({XMFLOAT3(1.0f,1.0f,1.0f),XMFLOAT4(Colors::Cyan)}),
+		Vertex({XMFLOAT3(1.0f,-1.0f,5.0f),XMFLOAT4(Colors::Magenta)})
+
+	};
+
+	std::array<std::uint16_t, 36> indices =
+	{
+		// 前
+		0, 1, 2,
+		0, 2 ,3,
+
+		// 后
+		4, 6, 5,
+		4, 7 ,6,
+
+		// 左
+		4, 5, 1,
+		4, 1, 0,
+
+		// 右
+		3, 2, 6,
+		3, 6, 7,
+
+		// 上
+		1, 5, 6,
+		1, 6, 2,
+
+		// 下
+		4, 0, 3,
+		4, 3, 7
+	};
+
+	const UINT vbByteSize = (UINT)vertices.size() * sizeof(Vertex);
+	const UINT ibByteSize = (UINT)indices.size() * sizeof(std::uint16_t);
+
+	mBoxGeo = std::make_unique<MeshGeometry>();
+	mBoxGeo->Name = "boxGeo";
+
+	ThrowIfFailed(D3DCreateBlob(vbByteSize, &mBoxGeo->VertexBufferCPU));
+	CopyMemory(mBoxGeo->VertexBufferCPU->GetBufferPointer(), vertices.data(), vbByteSize);
+
+	ThrowIfFailed(D3DCreateBlob(ibByteSize, &mBoxGeo->IndexBufferCPU));
+	CopyMemory(mBoxGeo->IndexBufferCPU->GetBufferPointer(), indices.data(), ibByteSize);
+
+	mBoxGeo->VertexBufferGPU = d3dUtil::CreateDefaultBuffer(
+		md3dDevice.Get(),
+		mCommandList.Get(),
+		vertices.data(),
+		vbByteSize,
+		mBoxGeo->VertexBufferUploader
+	);
+
+	mBoxGeo->IndexBufferGPU = d3dUtil::CreateDefaultBuffer(
+		md3dDevice.Get(),
+		mCommandList.Get(),
+		indices.data(),
+		ibByteSize,
+		mBoxGeo->IndexBufferUploader
+	);
+
+	// 与缓冲区相关数据
+	mBoxGeo->VertexByteStride = sizeof(Vertex);
+	mBoxGeo->VertexBufferByteSize = vbByteSize;
+	mBoxGeo->IndexFormat = DXGI_FORMAT_R16_UINT;
+	mBoxGeo->IndexBufferByteSize = ibByteSize;
+
+	// 利用SubmeshGeometry来定义MeshGeometry中存储的单个几何体
+	// 此结构体适用于将多个几何体数据存于一个顶点缓冲区和一个索引缓冲区的情况
+	// 它提供了对存于顶点缓冲区和索引缓冲区中的单个几何体进行绘制所需的数据和偏移量
+	SubmeshGeometry submesh;
+	submesh.IndexCount = (UINT)indices.size();
+	submesh.StartIndexLocation = 0;
+	submesh.BaseVertexLocation = 0;
+
+	mBoxGeo->DrawArgs["box"] = submesh;
+
+}
+
+void MyBox::BuildPSO()
+{
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc;
+	ZeroMemory(&psoDesc, sizeof(D3D12_GRAPHICS_PIPELINE_STATE_DESC));
+	psoDesc.InputLayout = { mInputLayout.data(), (UINT)mInputLayout.size() };
+	psoDesc.pRootSignature = mRootSignature.Get();
+	psoDesc.VS =
+	{
+		reinterpret_cast<BYTE*>(mvsByteCode->GetBufferPointer()),
+		mvsByteCode->GetBufferSize()
+	};
+	psoDesc.PS =
+	{
+		reinterpret_cast<BYTE*>(mpsByteCode->GetBufferPointer()),
+		mpsByteCode->GetBufferSize()
+	};
+	psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+	psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+	psoDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+	psoDesc.SampleMask = UINT_MAX;
+	psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+	psoDesc.NumRenderTargets = 1;
+	psoDesc.RTVFormats[0] = mBackBufferFormat;
+	psoDesc.SampleDesc.Count = m4xMsaaState ? 4 : 1;
+	psoDesc.SampleDesc.Quality = m4xMsaaState ? (m4xMsaaQuality - 1) : 0;
+	psoDesc.DSVFormat = mDepthStencilFormat;
+	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(
+		&psoDesc,
+		IID_PPV_ARGS(&mPSO)
+	));
+
+}
+
+void RunMyBox(HINSTANCE hInstance, HINSTANCE prevInstance, PSTR cmdLine, int showCmd)
+{
+	// 针对调试版本开启运行时内存检测
+#if defined(DEBUG) | defined(_DEBUG)
+	_CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
+#endif
+
+	try
+	{
+		MyBox theApp(hInstance);
+		if (!theApp.Initialize())
+			return;
+
+		theApp.Run();
+		
+	}
+	catch (DxException& e)
+	{
+		MessageBox(nullptr, e.ToString().c_str(), L"HR Failed", MB_OK);
+		MessageBeep(1);
+		return;
+	}
+
 }
